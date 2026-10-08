@@ -1,63 +1,168 @@
 package com.nowplaying;
 
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Locale;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-public class MediaDetector {
-    private static final int COMMAND_TIMEOUT = 3;
+/**
+ * Detects the currently playing track. On Linux (and Minecraft running under Wine) this talks MPRIS
+ * through {@code dbus-send}. Windows and macOS have basic, less-tested fallbacks.
+ *
+ * <p>Polling only runs between {@link #start()} and {@link #stop()}; the screen starts it when it opens
+ * and stops it when it closes, so nothing is spawned while the screen is closed. All process work happens
+ * off the render thread.
+ */
+public final class MediaDetector {
+    private static final int COMMAND_TIMEOUT_SECONDS = 3;
+    private static final int POLL_INTERVAL_SECONDS = 2;
 
-    // Robust multi-line block parsers for Linux MPRIS D-Bus output
-    private static final Pattern TITLE_BLOCK_PATTERN = Pattern.compile(
-        "string\\s+\\\"(?:xesam:)?title\\\"\\s*\\n\\s*variant\\s+string\\s+\\\"([^\\\"]+)\\\""
-    );
-    private static final Pattern ARTIST_BLOCK_PATTERN = Pattern.compile(
-        "string\\s+\\\"(?:xesam:)?artist\\\"\\s*\\n\\s*variant\\s+array\\s+\\[\\s*\\n?\\s*string\\s+\\\"([^\\\"]+)\\\""
-    );
-    private static final Pattern ART_URL_BLOCK_PATTERN = Pattern.compile(
-        "string\\s+\\\"mpris:artUrl\\\"\\s*\\n\\s*variant\\s+string\\s+\\\"([^\\\"]+)\\\""
-    );
-    private static final Pattern MPRIS_NAME_PATTERN = Pattern.compile("\\\"(org\\.mpris\\.MediaPlayer2\\.[^\\\"]+)\\\"");
+    private static final String MPRIS_PREFIX = "org.mpris.MediaPlayer2.";
+    private static final String MPRIS_PATH = "/org/mpris/MediaPlayer2";
+    private static final String PLAYER_INTERFACE = "org.mpris.MediaPlayer2.Player";
+    private static final Set<String> ALLOWED_COMMANDS = Set.of("Previous", "Next", "PlayPause");
 
-    // Thread-safe Caching Variables
-    private static volatile MediaMetadata currentMetadata = new MediaMetadata("None", "", "", "");
-    private static volatile String activeMprisPlayer = "org.mpris.MediaPlayer2.spotify"; 
+    // dbus-send prints strings raw (quotes are not escaped), so capture greedily up to the last quote on the line.
+    private static final Pattern BUS_NAME = Pattern.compile("\"(" + Pattern.quote(MPRIS_PREFIX) + "[^\"]+)\"");
+    private static final Pattern TITLE = Pattern.compile(
+            "string\\s+\"xesam:title\"\\s*\\n\\s*variant\\s+string\\s+\"(.*)\"\\s*$", Pattern.MULTILINE);
+    private static final Pattern ART_URL = Pattern.compile(
+            "string\\s+\"mpris:artUrl\"\\s*\\n\\s*variant\\s+string\\s+\"(.*)\"\\s*$", Pattern.MULTILINE);
+    private static final Pattern LENGTH = Pattern.compile(
+            "string\\s+\"mpris:length\"\\s*\\n\\s*variant\\s+u?int64\\s+(\\d+)");
+    private static final Pattern ARTIST_ARRAY = Pattern.compile(
+            "string\\s+\"xesam:artist\"\\s*\\n\\s*variant\\s+array\\s+\\[(.*?)\\n\\s*\\]", Pattern.DOTALL);
+    private static final Pattern ARRAY_STRING = Pattern.compile("^\\s*string\\s+\"(.*)\"\\s*$", Pattern.MULTILINE);
+    private static final Pattern STATUS = Pattern.compile("variant\\s+string\\s+\"(\\w+)\"");
+    private static final Pattern POSITION = Pattern.compile("variant\\s+int64\\s+(-?\\d+)");
 
-    // Background Polling Scheduler
-    private static final ScheduledExecutorService SCHEDULER = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "MediaDetector-Background");
-        t.setDaemon(true);
-        return t;
-    });
+    public enum PlaybackState { PLAYING, PAUSED, STOPPED, UNKNOWN }
 
-    static {
-        SCHEDULER.scheduleAtFixedRate(MediaDetector::pollMetadata, 0, 2, TimeUnit.SECONDS);
-    }
+    /** Immutable snapshot of one poll. Position is as sampled; use {@link #progress()} for the live value. */
+    public record MediaMetadata(String source, String title, String artist, String artUrl,
+                                PlaybackState state, long positionMicros, long lengthMicros, long sampledAtNanos) {
+        public static final MediaMetadata NONE =
+                new MediaMetadata("None", "", "", "", PlaybackState.STOPPED, -1, -1, 0);
 
-    public static record MediaMetadata(String source, String title, String artist, String artUrl) {
         public boolean hasTrack() {
             return title != null && !title.isBlank();
         }
+
         public boolean hasArtUrl() {
             return artUrl != null && !artUrl.isBlank();
         }
+
+        public boolean isPlaying() {
+            return state == PlaybackState.PLAYING;
+        }
+
+        public boolean hasTimeline() {
+            return lengthMicros > 0 && positionMicros >= 0;
+        }
+
+        /** Playback progress in [0, 1], extrapolated from the last sample while playing. */
+        public float progress() {
+            if (!hasTimeline()) return 0f;
+            long position = positionMicros;
+            if (isPlaying()) {
+                position += (System.nanoTime() - sampledAtNanos) / 1_000L;
+            }
+            return Math.clamp((float) position / (float) lengthMicros, 0f, 1f);
+        }
+    }
+
+    private static final Object POLL_LOCK = new Object();
+    private static final ExecutorService IO = Executors.newCachedThreadPool(daemonFactory("MediaDetector-IO"));
+
+    private static volatile MediaMetadata currentMetadata = MediaMetadata.NONE;
+    private static volatile String activeMprisPlayer = null;
+    private static volatile ScheduledExecutorService scheduler;
+    private static volatile boolean warnedMissingDbus = false;
+
+    private MediaDetector() {
+    }
+
+    // ---------------------------------------------------------------- lifecycle
+
+    /** Starts background polling. Safe to call repeatedly. */
+    public static synchronized void start() {
+        if (scheduler != null) return;
+        ScheduledExecutorService s = Executors.newSingleThreadScheduledExecutor(daemonFactory("MediaDetector-Poller"));
+        s.scheduleWithFixedDelay(MediaDetector::pollSafely, 0, POLL_INTERVAL_SECONDS, TimeUnit.SECONDS);
+        scheduler = s;
+    }
+
+    /** Stops background polling. The last snapshot stays readable. */
+    public static synchronized void stop() {
+        ScheduledExecutorService s = scheduler;
+        scheduler = null;
+        if (s != null) s.shutdownNow();
     }
 
     public static MediaMetadata getCurrentlyPlayingMetadata() {
         return currentMetadata;
     }
 
-    public static void refreshMetadata() {
-        try {
-            pollMetadata();
-        } catch (Exception ignored) {}
+    /** Requests an immediate poll without blocking the caller. */
+    public static void refreshAsync() {
+        IO.execute(MediaDetector::pollSafely);
+    }
+
+    /** True when there is a player that playback commands can be sent to. */
+    public static boolean canControl() {
+        return activeMprisPlayer != null;
+    }
+
+    /** Sends Previous / Next / PlayPause to the active player without blocking, then re-polls. */
+    public static void sendCommand(String method) {
+        String player = activeMprisPlayer;
+        if (player == null || !ALLOWED_COMMANDS.contains(method)) return;
+        IO.execute(() -> {
+            run(List.of("dbus-send", "--session", "--print-reply", "--dest=" + player,
+                    MPRIS_PATH, PLAYER_INTERFACE + "." + method));
+            pollSafely();
+        });
+    }
+
+    // ---------------------------------------------------------------- polling
+
+    private static void pollSafely() {
+        synchronized (POLL_LOCK) {
+            try {
+                currentMetadata = poll();
+            } catch (Exception e) {
+                NowPlayingSys.LOGGER.debug("Media poll failed", e);
+                currentMetadata = MediaMetadata.NONE;
+            }
+        }
+    }
+
+    private static MediaMetadata poll() {
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        if (os.contains("linux") || (os.contains("win") && isRunningUnderWine())) {
+            return pollLinux();
+        }
+        if (os.contains("win")) {
+            return pollWindows();
+        }
+        if (os.contains("mac")) {
+            return pollMac();
+        }
+        return MediaMetadata.NONE;
     }
 
     private static boolean isRunningUnderWine() {
@@ -65,174 +170,199 @@ public class MediaDetector {
                 || System.getenv("WINELOADER") != null;
     }
 
-    private static void pollMetadata() {
-        String os = System.getProperty("os.name").toLowerCase(Locale.ROOT);
-        try {
-            if (os.contains("linux")) {
-                currentMetadata = getLinuxMediaMetadata();
-            } else if (os.contains("win") && isRunningUnderWine()) {
-                // Running under Wine on Linux — use MPRIS/D-Bus instead of PowerShell
-                currentMetadata = getLinuxMediaMetadata();
-            } else if (os.contains("win")) {
-                currentMetadata = getWindowsMediaMetadata();
-            } else if (os.contains("mac")) {
-                currentMetadata = getMacMediaMetadata();
-            } else {
-                currentMetadata = new MediaMetadata("None", "", "", "");
-            }
-        } catch (Exception e) {
-            currentMetadata = new MediaMetadata("Error", "Error fetching data", "", "");
+    // ---------------------------------------------------------------- Linux / MPRIS
+
+    private static MediaMetadata pollLinux() {
+        List<String[]> players = new ArrayList<>();
+        for (String bus : listMprisPlayers()) {
+            players.add(new String[]{bus, readStatus(bus)});
         }
-    }
 
-    public static String buildMprisCommand(String method) {
-        return String.format(
-            "dbus-send --print-reply --dest=%s /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player.%s 2>/dev/null",
-            activeMprisPlayer, method
-        );
-    }
+        // Prefer a playing player (sticking with the current one), then paused ones, so two players don't flap.
+        String active = activeMprisPlayer;
+        players.sort(Comparator.comparingInt(p -> rank(p, active)));
 
-    public static boolean sendMprisCommand(String method) {
-        try {
-            String command = buildMprisCommand(method);
-            Process process = new ProcessBuilder("bash", "-c", command)
-                .redirectErrorStream(true)
-                .start();
-            boolean finished = process.waitFor(COMMAND_TIMEOUT, TimeUnit.SECONDS);
-            if (!finished) process.destroyForcibly();
-            return finished && process.exitValue() == 0;
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    private static MediaMetadata getLinuxMediaMetadata() throws IOException, InterruptedException {
-        for (String player : listMprisPlayers()) {
-            String source = player.substring(player.lastIndexOf('.') + 1);
-            MediaMetadata metadata = getLinuxMetadataFromPlayer(player, source);
-            
+        for (String[] player : players) {
+            MediaMetadata metadata = readPlayer(player[0], player[1]);
             if (metadata.hasTrack()) {
-                activeMprisPlayer = player;
+                activeMprisPlayer = player[0];
                 return metadata;
             }
         }
-        return new MediaMetadata("None", "", "", "");
+        activeMprisPlayer = null;
+        return MediaMetadata.NONE;
     }
 
-    private static String[] listMprisPlayers() throws IOException, InterruptedException {
-        String namesOutput = runCommand(new String[]{
-            "bash", "-c",
-            "dbus-send --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>/dev/null"
-        });
-        if (namesOutput.equals("Error")) return new String[0];
-
-        return MPRIS_NAME_PATTERN.matcher(namesOutput).results()
-            .map(matchResult -> matchResult.group(1))
-            .toArray(String[]::new);
+    private static int rank(String[] player, String active) {
+        boolean isActive = player[0].equals(active);
+        return switch (player[1]) {
+            case "Playing" -> isActive ? 0 : 1;
+            case "Paused" -> isActive ? 2 : 3;
+            default -> 4;
+        };
     }
 
-    private static MediaMetadata getLinuxMetadataFromPlayer(String player, String source) throws IOException, InterruptedException {
-        String output = runCommand(new String[]{
-            "bash", "-c",
-            "dbus-send --print-reply --dest=" + player + " /org/mpris/MediaPlayer2 " +
-            "org.freedesktop.DBus.Properties.Get string:org.mpris.MediaPlayer2.Player string:Metadata 2>/dev/null"
-        });
-        return new MediaMetadata(source, extractTitle(output), extractArtist(output), extractArtUrl(output));
+    private static List<String> listMprisPlayers() {
+        String output = run(List.of("dbus-send", "--session", "--print-reply", "--dest=org.freedesktop.DBus",
+                "/org/freedesktop/DBus", "org.freedesktop.DBus.ListNames"));
+        List<String> names = new ArrayList<>();
+        if (output == null) return names;
+        Matcher m = BUS_NAME.matcher(output);
+        while (m.find()) names.add(m.group(1));
+        return names;
     }
 
-    private static MediaMetadata getWindowsMediaMetadata() throws IOException, InterruptedException {
-        String tmpPath = new File(System.getProperty("java.io.tmpdir"), "mcmusic_art.jpg").getAbsolutePath().replace("\\", "/");
-        
-        String psScript = "$s = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync().GetAwaiter().GetResult().GetCurrentSession(); " +
-                          "if ($s) { " +
-                          "  $p = $s.TryGetMediaPropertiesAsync().GetAwaiter().GetResult(); " +
-                          "  $artUrl = ''; " +
-                          "  if ($p.Thumbnail) { " +
-                          "    $stream = $p.Thumbnail.OpenReadAsync().GetAwaiter().GetResult(); " +
-                          "    $buffer = New-Object Byte[] $stream.Size; " +
-                          "    $reader = New-Object Windows.Storage.Streams.DataReader $stream; " +
-                          "    $reader.LoadAsync($stream.Size).GetAwaiter().GetResult(); " +
-                          "    $reader.ReadBytes($buffer); " +
-                          "    [System.IO.File]::WriteAllBytes('" + tmpPath + "', $buffer); " +
-                          "    $artUrl = 'file://" + tmpPath + "'; " +
-                          "  }; " +
-                          "  Write-Output ($p.Title + '|||' + $p.Artist + '|||' + $artUrl) " +
-                          "}";
-        
-        String output = runCommand(new String[]{"powershell", "-NoProfile", "-Command", psScript});
-        
-        if (!output.equals("Error") && !output.isBlank()) {
-            String[] parts = output.split("\\|\\|\\|");
-            String title = parts.length > 0 ? parts[0].trim() : "";
-            String artist = parts.length > 1 ? parts[1].trim() : "";
-            String artUrl = parts.length > 2 ? parts[2].trim() : "";
-            if (!title.isEmpty()) return new MediaMetadata("Windows", title, artist, artUrl);
+    private static String dbusGet(String bus, String property) {
+        return run(List.of("dbus-send", "--session", "--print-reply", "--dest=" + bus, MPRIS_PATH,
+                "org.freedesktop.DBus.Properties.Get", "string:" + PLAYER_INTERFACE, "string:" + property));
+    }
+
+    private static String readStatus(String bus) {
+        String output = dbusGet(bus, "PlaybackStatus");
+        Matcher m = output == null ? null : STATUS.matcher(output);
+        return m != null && m.find() ? m.group(1) : "Stopped";
+    }
+
+    private static MediaMetadata readPlayer(String bus, String status) {
+        String metadata = dbusGet(bus, "Metadata");
+        if (metadata == null) return MediaMetadata.NONE;
+
+        String title = extractTitle(metadata);
+        if (title.isBlank()) return MediaMetadata.NONE;
+
+        PlaybackState state = switch (status) {
+            case "Playing" -> PlaybackState.PLAYING;
+            case "Paused" -> PlaybackState.PAUSED;
+            default -> PlaybackState.STOPPED;
+        };
+
+        long position = -1;
+        String positionOutput = dbusGet(bus, "Position");
+        Matcher pm = positionOutput == null ? null : POSITION.matcher(positionOutput);
+        if (pm != null && pm.find()) position = Long.parseLong(pm.group(1));
+
+        return new MediaMetadata(displayName(bus), title, extractArtist(metadata), extractArtUrl(metadata),
+                state, position, extractLength(metadata), System.nanoTime());
+    }
+
+    /** "org.mpris.MediaPlayer2.firefox.instance1234" -> "Firefox". */
+    static String displayName(String bus) {
+        String name = bus.startsWith(MPRIS_PREFIX) ? bus.substring(MPRIS_PREFIX.length()) : bus;
+        name = name.replaceFirst("\\.instance\\d+$", "");
+        int dot = name.lastIndexOf('.');
+        if (dot >= 0) name = name.substring(dot + 1);
+        return name.isEmpty() ? "Unknown" : Character.toUpperCase(name.charAt(0)) + name.substring(1);
+    }
+
+    static String extractTitle(String output) {
+        Matcher m = TITLE.matcher(output);
+        return m.find() ? m.group(1).trim() : "";
+    }
+
+    static String extractArtist(String output) {
+        Matcher block = ARTIST_ARRAY.matcher(output);
+        if (!block.find()) return "";
+        List<String> artists = new ArrayList<>();
+        Matcher m = ARRAY_STRING.matcher(block.group(1));
+        while (m.find()) artists.add(m.group(1).trim());
+        return String.join(", ", artists);
+    }
+
+    static String extractArtUrl(String output) {
+        Matcher m = ART_URL.matcher(output);
+        return m.find() ? m.group(1).trim() : "";
+    }
+
+    static long extractLength(String output) {
+        Matcher m = LENGTH.matcher(output);
+        return m.find() ? Long.parseLong(m.group(1)) : -1;
+    }
+
+    // ---------------------------------------------------------------- Windows / macOS (basic, untested)
+
+    private static MediaMetadata pollWindows() {
+        File art = new File(System.getProperty("java.io.tmpdir"), "nowplayingsys_art.jpg");
+        String artPath = art.getAbsolutePath().replace("\\", "/");
+        String script = "$s = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync().GetAwaiter().GetResult().GetCurrentSession(); "
+                + "if ($s) { "
+                + "  $p = $s.TryGetMediaPropertiesAsync().GetAwaiter().GetResult(); "
+                + "  $artUrl = ''; "
+                + "  if ($p.Thumbnail) { "
+                + "    $stream = $p.Thumbnail.OpenReadAsync().GetAwaiter().GetResult(); "
+                + "    $buffer = New-Object Byte[] $stream.Size; "
+                + "    $reader = New-Object Windows.Storage.Streams.DataReader $stream; "
+                + "    $reader.LoadAsync($stream.Size).GetAwaiter().GetResult(); "
+                + "    $reader.ReadBytes($buffer); "
+                + "    [System.IO.File]::WriteAllBytes('" + artPath + "', $buffer); "
+                + "    $artUrl = 'file:///" + artPath + "'; "
+                + "  }; "
+                + "  Write-Output ($p.Title + '|||' + $p.Artist + '|||' + $artUrl) "
+                + "}";
+
+        String output = run(List.of("powershell", "-NoProfile", "-Command", script));
+        if (output == null || output.isBlank()) return MediaMetadata.NONE;
+
+        String[] parts = output.trim().split("\\|\\|\\|", -1);
+        String title = parts[0].trim();
+        if (title.isEmpty()) return MediaMetadata.NONE;
+        String artist = parts.length > 1 ? parts[1].trim() : "";
+        String artUrl = parts.length > 2 ? parts[2].trim() : "";
+        return new MediaMetadata("Windows", title, artist, artUrl, PlaybackState.UNKNOWN, -1, -1, System.nanoTime());
+    }
+
+    private static MediaMetadata pollMac() {
+        String track = run(List.of("osascript", "-e",
+                "tell application \"Spotify\" to if running then get name of current track"));
+        if (track == null) return MediaMetadata.NONE;
+        track = track.trim();
+        if (track.isEmpty() || track.equals("missing value")) return MediaMetadata.NONE;
+        return new MediaMetadata("Spotify", track, "", "", PlaybackState.UNKNOWN, -1, -1, System.nanoTime());
+    }
+
+    // ---------------------------------------------------------------- process helper
+
+    /**
+     * Runs a command and returns its stdout, or {@code null} on failure, non-zero exit or timeout.
+     * Output is drained concurrently so a chatty process can't block on a full pipe.
+     */
+    private static String run(List<String> command) {
+        Process process;
+        try {
+            process = new ProcessBuilder(command)
+                    .redirectError(ProcessBuilder.Redirect.DISCARD)
+                    .start();
+        } catch (IOException e) {
+            if (!warnedMissingDbus) {
+                warnedMissingDbus = true;
+                NowPlayingSys.LOGGER.warn("Could not run '{}': {}", command.get(0), e.getMessage());
+            }
+            return null;
         }
-        return new MediaMetadata("None", "", "", "");
-    }
 
-    private static MediaMetadata getMacMediaMetadata() throws IOException, InterruptedException {
-        String track = runCommand(new String[]{"osascript", "-e", "tell application \"Spotify\" to if running then get name of current track"});
-        if (!track.equals("Error") && !track.equals("missing value") && !track.isBlank()) {
-            return new MediaMetadata("Spotify", track, "", "");
-        }
-        return new MediaMetadata("None", "", "", "");
-    }
-
-    private static String runCommand(String[] command) throws IOException, InterruptedException {
-        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
-        if (!process.waitFor(COMMAND_TIMEOUT, TimeUnit.SECONDS)) {
+        Future<String> output = IO.submit(
+                () -> new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8));
+        try {
+            if (!process.waitFor(COMMAND_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                return null;
+            }
+            String text = output.get(1, TimeUnit.SECONDS);
+            return process.exitValue() == 0 ? text : null;
+        } catch (InterruptedException e) {
             process.destroyForcibly();
-            return "Error";
-        }
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-            StringBuilder output = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) output.append(line).append("\n");
-            return output.toString().trim().isEmpty() ? "Error" : output.toString().trim();
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (ExecutionException | TimeoutException e) {
+            process.destroyForcibly();
+            return null;
         }
     }
 
-    static String extractTitle(String metadata) {
-        if (metadata == null || metadata.equals("Error")) return "";
-        Matcher m = TITLE_BLOCK_PATTERN.matcher(metadata);
-        return m.find() ? m.group(1).trim() : "";
-    }
-
-    static String extractArtist(String metadata) {
-        if (metadata == null || metadata.equals("Error")) return "";
-        Matcher m = ARTIST_BLOCK_PATTERN.matcher(metadata);
-        return m.find() ? m.group(1).trim() : "";
-    }
-
-    private static String extractArtUrl(String dbusOutput) {
-        if (dbusOutput == null || dbusOutput.equals("Error")) return "";
-        Matcher matcher = ART_URL_BLOCK_PATTERN.matcher(dbusOutput);
-        return matcher.find() ? matcher.group(1).trim() : "";
-    }
-
-    public static String getCurrentlyPlaying() {
-        MediaMetadata metadata = getCurrentlyPlayingMetadata();
-        if (metadata == null || !metadata.hasTrack()) {
-            return "No media detected";
-        }
-        return formatHudText(metadata);
-    }
-
-    public static String formatHudText(MediaMetadata metadata) {
-        if (metadata == null || !metadata.hasTrack()) {
-            return "Now Playing: Nothing";
-        }
-        if (metadata.artist() != null && !metadata.artist().isBlank()) {
-            return "Now Playing: " + metadata.title() + " — " + metadata.artist();
-        }
-        return "Now Playing: " + metadata.title();
-    }
-
-    public static String formatHudText(String track) {
-        if (track == null || track.isBlank()) {
-            return "Now Playing: Nothing";
-        }
-        return "Now Playing: " + track;
+    private static ThreadFactory daemonFactory(String name) {
+        return runnable -> {
+            Thread thread = new Thread(runnable, name);
+            thread.setDaemon(true);
+            return thread;
+        };
     }
 }

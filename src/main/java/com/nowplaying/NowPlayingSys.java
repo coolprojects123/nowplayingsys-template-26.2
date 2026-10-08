@@ -10,8 +10,7 @@ public class NowPlayingSys implements ModInitializer {
 
     @Override
     public void onInitialize() {
-        String currentTrack = MediaDetector.getCurrentlyPlaying();
-        LOGGER.info("NowPlayingSys initialized. Current track: {}", currentTrack);
-        LOGGER.info("HUD overlay is enabled. Open a world and look at the top-left corner to see the current track.");
+        // Media polling is client-only and starts when the Now Playing screen opens (see NowPlayingScreen).
+        LOGGER.info("NowPlayingSys initialized.");
     }
 }

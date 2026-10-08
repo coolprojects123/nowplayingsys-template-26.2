@@ -8,25 +8,14 @@ group = project.maven_group
 
 repositories {
 	maven {
-		name = 'DAQEM Studios Maven'
-		url = 'https://maven.daqem.com/releases'
+		url = 'https://maven.fabricmc.net/' // For Fabric API
 	}
-    maven { 
-		url = 'https://maven.fabricmc.net/' 
-	} // For Fabric API
 }
 
 dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     implementation "net.fabricmc:fabric-loader:${project.loader_version}"
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
-
-    // UI Lib (MC 26.1.x compatible)
-	implementation 'com.daqem.uilib:uilib-fabric:21.1.1'
-
-    // DBus (for MPRIS)
-    implementation "com.github.hypfvieh:dbus-java-core:5.2.0"
-    implementation "com.github.hypfvieh:dbus-java-transport-tcp:5.2.0"
 
 	testImplementation platform("org.junit:junit-bom:5.10.2")
 	testImplementation "org.junit.jupiter:junit-jupiter"
