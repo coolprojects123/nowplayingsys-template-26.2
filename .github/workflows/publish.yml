@@ -1,0 +1,36 @@
+name: Publish Mod to Modrinth
+
+on:
+  release:
+    types: [published] # Triggers when you publish a new GitHub Release
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21' # Change to match your mod's Java version
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Build mod JAR
+        run: ./gradlew build
+
+      - name: Publish to Modrinth
+        uses: cloudnode-pro/modrinth-publish@v2
+        with:
+          token: ${{ secrets.MODRINTH_TOKEN }}
+          project: 'YOUR_MODRINTH_PROJECT_ID' # Replace with your Modrinth project ID
+          version: ${{ github.event.release.tag_name }}
+          loaders: |-
+            fabric # Change or add: fabric, forge, neoforge, quilt, etc.
+          game-versions: |-
+            1.20.4 # List supported Minecraft versions, one per line
+          files: 'build/libs/your-mod-filename-${{ github.event.release.tag_name }}.jar'

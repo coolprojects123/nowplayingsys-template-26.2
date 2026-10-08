@@ -34,11 +34,15 @@ jobs:
   publish:
     runs-on: ubuntu-24.04
     needs: build
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      contents: write
     steps:
       - name: checkout repository
         uses: actions/checkout@v6
       - name: download build artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v7
         with:
           name: Artifacts
       - name: publish to release
