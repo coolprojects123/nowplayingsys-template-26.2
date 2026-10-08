@@ -66,4 +66,31 @@ class MediaDetectorTest {
         assertEquals(1.0f, new MediaMetadata("x", "t", "a", "", PlaybackState.PAUSED, 999L, 100L, 0).progress());
         assertEquals(0.0f, MediaMetadata.NONE.progress());
     }
+
+    @Test
+    void parsesWindowsHelperLine() {
+        MediaMetadata m = MediaDetector.parseWindowsLine(
+                "OK\tSpotify.exe\tSong\tArtist\tPaused\t1000\t3000\tfile:///C:/a.img");
+        assertEquals("Song", m.title());
+        assertEquals("Artist", m.artist());
+        assertEquals(PlaybackState.PAUSED, m.state());
+        assertEquals(1_000_000L, m.positionMicros());
+        assertEquals(3_000_000L, m.lengthMicros());
+        assertEquals("file:///C:/a.img", m.artUrl());
+    }
+
+    @Test
+    void windowsHelperNoneAndMalformedLinesGiveNoTrack() {
+        assertEquals(false, MediaDetector.parseWindowsLine("NONE").hasTrack());
+        assertEquals(false, MediaDetector.parseWindowsLine("OK\tX\tT").hasTrack());
+        assertEquals(false, MediaDetector.parseWindowsLine("OK\tX\t\tA\tPlaying\t1\t2\t").hasTrack());
+        assertEquals(false, MediaDetector.parseWindowsLine("OK\tX\tT\tA\tPlaying\t-1\t-1\t").hasTimeline());
+    }
+
+    @Test
+    void windowsSourceNames() {
+        assertEquals("Spotify", MediaDetector.windowsSourceName("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"));
+        assertEquals("Chrome", MediaDetector.windowsSourceName("chrome.exe"));
+        assertEquals("Windows", MediaDetector.windowsSourceName(""));
+    }
 }

@@ -10,12 +10,11 @@ import com.daqem.uilib.gui.widget.ButtonWidget;
 import com.mojang.blaze3d.platform.NativeImage;
 import com.nowplaying.MediaDetector;
 import com.nowplaying.MediaDetector.MediaMetadata;
-import com.nowplaying.NowPlayingClient;
 import com.nowplaying.NowPlayingSys;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.Tooltip;
-import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.renderer.RenderPipelines;
 import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.network.chat.Component;
@@ -43,6 +42,8 @@ public class NowPlayingScreen extends AbstractScreen {
     private static final int ALBUM_SIZE = 144;
     private static final int PROGRESS_WIDTH = 182;
     private static final int PROGRESS_HEIGHT = 6;
+    /** Right column is 192 wide and text starts 8 in; leave a margin on the right too (and 1px for the title shadow). */
+    private static final int TEXT_MAX_WIDTH = 168;
 
     private static final Identifier FALLBACK_ALBUM_ART =
             Identifier.fromNamespaceAndPath(NowPlayingSys.MOD_ID, "textures/gui/album_art.png");
@@ -85,7 +86,6 @@ public class NowPlayingScreen extends AbstractScreen {
 
     @Override
     public void init() {
-        NowPlayingSys.LOGGER.info("[diag] NowPlayingScreen init {}x{}", this.width, this.height);
         this.clear();
         MediaDetector.start();
 
@@ -121,9 +121,12 @@ public class NowPlayingScreen extends AbstractScreen {
         ColorComponent progressTrack = new ColorComponent(rightPaneX + 8, panelY + 122, PROGRESS_WIDTH, PROGRESS_HEIGHT, 0xFF1A3557);
         progressFill = new ColorComponent(rightPaneX + 8, panelY + 122, 0, PROGRESS_HEIGHT, 0xFF57A6FF);
 
-        TruncatedTextComponent nowPlayingLabel = new TruncatedTextComponent(panelX + 30, panelY + 176, 132,
-                Component.literal("Now Playing"), 0xFFD9E6F7);
-        nowPlayingLabel.setTextAlign(TextAlign.CENTER);
+        String labelText = "Now Playing";
+        int labelWidth = Minecraft.getInstance().font.width(labelText);
+        TruncatedTextComponent nowPlayingLabel = new TruncatedTextComponent(
+                panelX + 24 + (ALBUM_SIZE - labelWidth) / 2, panelY + 176, labelWidth + 4,
+                Component.literal(labelText), 0xFFD9E6F7);
+        nowPlayingLabel.setTextAlign(TextAlign.LEFT);
 
         prevButton = new ButtonWidget(rightPaneX + 8, panelY + 156, 56, 20, Component.literal("Prev"),
                 button -> MediaDetector.sendCommand("Previous"));
@@ -188,8 +191,8 @@ public class NowPlayingScreen extends AbstractScreen {
 
     private void applyMetadata(MediaMetadata metadata) {
         if (!metadata.hasTrack()) {
-            titleText.setText(Component.literal("No media detected"));
-            artistText.setText(Component.literal("Open a player to begin"));
+            titleText.setText(Component.literal(fit("No media detected")));
+            artistText.setText(Component.literal(fit("Open a player to begin")));
             sourceText.setText(Component.literal("Source: None"));
             statusText.setText(Component.literal("Status: Idle"));
             playPauseButton.setMessage(Component.literal("Play"));
@@ -199,11 +202,11 @@ public class NowPlayingScreen extends AbstractScreen {
             return;
         }
 
-        titleText.setText(Component.literal(metadata.title()));
+        titleText.setText(Component.literal(fit(metadata.title())));
         String artist = metadata.artist();
-        artistText.setText(Component.literal(artist == null || artist.isBlank() ? "Unknown Artist" : artist));
-        sourceText.setText(Component.literal("Source: " + metadata.source()));
-        statusText.setText(Component.literal("Status: " + statusLabel(metadata.state())));
+        artistText.setText(Component.literal(fit(artist == null || artist.isBlank() ? "Unknown Artist" : artist)));
+        sourceText.setText(Component.literal(fit("Source: " + metadata.source())));
+        statusText.setText(Component.literal(fit("Status: " + statusLabel(metadata.state()))));
         playPauseButton.setMessage(Component.literal(metadata.isPlaying() ? "Pause" : "Play"));
         setControlsEnabled(MediaDetector.canControl());
 
@@ -213,6 +216,16 @@ public class NowPlayingScreen extends AbstractScreen {
             wantedArtUrl = "";
             setFallbackAlbumArt();
         }
+    }
+
+    /** Truncates with "..." so long titles can't spill out of the panel (TruncatedTextComponent didn't). */
+    private static String fit(String text) {
+        Font font = Minecraft.getInstance().font;
+        if (font.width(text) <= TEXT_MAX_WIDTH) {
+            return text;
+        }
+        String ellipsis = "...";
+        return font.plainSubstrByWidth(text, TEXT_MAX_WIDTH - font.width(ellipsis)) + ellipsis;
     }
 
     private static String statusLabel(MediaDetector.PlaybackState state) {
@@ -400,18 +413,7 @@ public class NowPlayingScreen extends AbstractScreen {
     }
 
     @Override
-    public boolean keyPressed(KeyEvent event) {
-        // The open key can't fire while a screen is open, so let it close this one too.
-        if (NowPlayingClient.openKey != null && NowPlayingClient.openKey.matches(event)) {
-            this.onClose();
-            return true;
-        }
-        return super.keyPressed(event);
-    }
-
-    @Override
     public void removed() {
-        NowPlayingSys.LOGGER.info("[diag] NowPlayingScreen removed", new Throwable("close trace"));
         MediaDetector.stop();
         // Any in-flight load finishes on its own thread; its result is dropped with the screen.
         albumArtFuture = null;
