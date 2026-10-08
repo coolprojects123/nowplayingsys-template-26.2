@@ -36,6 +36,8 @@ jobs:
     needs: build
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      contents: write
     steps:
       - name: checkout repository
         uses: actions/checkout@v6
