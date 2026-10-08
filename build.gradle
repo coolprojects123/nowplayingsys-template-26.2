@@ -21,8 +21,9 @@ dependencies {
     implementation "net.fabricmc:fabric-loader:${project.loader_version}"
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 
-	// UI Lib
+	// UI Lib, bundled into the mod jar (jar-in-jar) so players don't need to install it separately
 	implementation 'com.daqem.uilib:uilib-fabric:21.1.1'
+	include 'com.daqem.uilib:uilib-fabric:21.1.1'
 
 	testImplementation platform("org.junit:junit-bom:5.10.2")
 	testImplementation "org.junit.jupiter:junit-jupiter"

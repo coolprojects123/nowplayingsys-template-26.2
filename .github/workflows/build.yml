@@ -1,7 +1,15 @@
-# Automatically build the project and run any configured tests for every push
-# and submitted pull request. This can help catch issues that only occur on
-# certain platforms or Java versions, and provides a first line of defence
-# against bad commits.
+# Builds on every push and pull request. Pushing a tag also publishes a GitHub release and a Modrinth version.
+#
+# Tag format: v<version>+<minecraft>   e.g.  v1.2.0+26.3   or   v1.2.0-beta.1+26.2
+#   - the tag becomes the mod version (the leading "v" is dropped; "+<minecraft>" is added if you leave it off)
+#   - which Minecraft versions a build supports is decided below (the "supported versions" table), keyed on
+#     minecraft_version in gradle.properties, so this exact file works unchanged on the 26.2 and 26.3 branches
+#   - nothing else in the repo needs to change: the version is passed to Gradle as -Pmod_version, and the
+#     Minecraft range, author and links are patched into fabric.mod.json during the CI build only
+#   - "alpha" in the version -> alpha channel, "beta" or "rc" -> beta, anything else -> release
+#   - the changelog is the commit list since the previous tag
+#
+# Repo secrets needed: MODRINTH_TOKEN, MODRINTH_PROJECT_ID
 
 name: build
 on: [pull_request, push]
@@ -9,9 +17,101 @@ on: [pull_request, push]
 jobs:
   build:
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      mc_version: ${{ steps.meta.outputs.mc_version }}
+      mc_label: ${{ steps.meta.outputs.mc_label }}
+      game_versions: ${{ steps.meta.outputs.game_versions }}
+      channel: ${{ steps.meta.outputs.channel }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      changelog: ${{ steps.meta.outputs.changelog }}
     steps:
       - name: checkout repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history and tags, needed for the changelog
+
+      - name: work out version and release metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          MC="$(grep '^minecraft_version=' gradle.properties | cut -d= -f2 | tr -d '\r')"
+          BASE="$(grep '^mod_version=' gradle.properties | cut -d= -f2 | tr -d '\r')"
+
+          # Supported versions table: edit here when a branch gains or loses a Minecraft version.
+          #   MC_RANGE = the dependency written into fabric.mod.json
+          #   GV_RAW   = the game versions listed on Modrinth (comma separated)
+          case "$MC" in
+            26.2) MC_RANGE='>=26.1 <26.3'; GV_RAW='26.1,26.1.1,26.1.2,26.2' ;;
+            26.3) MC_RANGE='~26.3';        GV_RAW='26.3' ;;
+            *)    MC_RANGE="~$MC";         GV_RAW="$MC" ;;
+          esac
+          GAME_VERSIONS="$(echo "$GV_RAW" | tr ',' '\n')"
+          FIRST="$(echo "$GAME_VERSIONS" | head -n 1)"
+          LAST="$(echo "$GAME_VERSIONS" | tail -n 1)"
+          if [ "$FIRST" = "$LAST" ]; then MC_LABEL="$FIRST"; else MC_LABEL="$FIRST to $LAST"; fi
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            [[ "$VERSION" == *+* ]] || VERSION="$VERSION+$MC"
+            IS_RELEASE=true
+          else
+            VERSION="$BASE-dev.$GITHUB_RUN_NUMBER+$MC"
+            IS_RELEASE=false
+          fi
+
+          case "$VERSION" in
+            *alpha*)      CHANNEL=alpha ;;
+            *beta*|*rc*)  CHANNEL=beta ;;
+            *)            CHANNEL=release ;;
+          esac
+          if [ "$CHANNEL" = release ]; then PRERELEASE=false; else PRERELEASE=true; fi
+
+          : > changelog.md
+          if [ "$IS_RELEASE" = true ]; then
+            PREV="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+            if [ -n "$PREV" ]; then RANGE="$PREV..HEAD"; else RANGE="HEAD"; fi
+            git log "$RANGE" --no-merges --pretty='- %s (%h)' | head -n 50 > changelog.md || true
+          fi
+          [ -s changelog.md ] || echo "No changes recorded." > changelog.md
+
+          {
+            echo "version=$VERSION"
+            echo "mc_version=$MC"
+            echo "mc_label=$MC_LABEL"
+            echo "mc_range=$MC_RANGE"
+            echo "game_versions<<GAME_VERSIONS_EOF"
+            echo "$GAME_VERSIONS"
+            echo "GAME_VERSIONS_EOF"
+            echo "channel=$CHANNEL"
+            echo "prerelease=$PRERELEASE"
+            echo "changelog<<CHANGELOG_EOF"
+            cat changelog.md
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building $VERSION (channel: $CHANNEL, builds against Minecraft $MC, lists $MC_LABEL)"
+
+      - name: stamp fabric.mod.json (CI build only, not committed)
+        env:
+          MC_RANGE: ${{ steps.meta.outputs.mc_range }}
+          MOD_AUTHOR: ${{ github.repository_owner }}
+          MOD_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          path = "src/main/resources/fabric.mod.json"
+          with open(path, encoding="utf-8") as f:
+              mod = json.load(f)
+          url = os.environ["MOD_URL"]
+          mod["depends"]["minecraft"] = os.environ["MC_RANGE"]
+          mod["authors"] = [os.environ["MOD_AUTHOR"]]
+          mod["contact"] = {"homepage": url, "sources": url}
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(mod, f, indent="\t")
+              f.write("\n")
+          print(json.dumps(mod, indent=2))
+          PY
+
       - name: validate gradle wrapper
         uses: gradle/actions/wrapper-validation@v4
       - name: setup jdk
@@ -21,15 +121,19 @@ jobs:
           distribution: 'microsoft'
       - name: make gradle wrapper executable
         run: chmod +x ./gradlew
+
       - name: build
-        run: ./gradlew build
+        env:
+          MOD_VERSION: ${{ steps.meta.outputs.version }}
+        run: ./gradlew build -Pmod_version="$MOD_VERSION"
+
       - name: capture build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Artifacts
           path: build/libs/
 
-  # Create a GitHub release with the jars when a tag is pushed.
+  # GitHub release with the jars, created when a tag is pushed.
   release:
     runs-on: ubuntu-24.04
     needs: build
@@ -49,16 +153,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
-          name: Release ${{ github.ref_name }}
+          name: NowPlayingSys ${{ needs.build.outputs.version }} for Minecraft ${{ needs.build.outputs.mc_label }}
+          body: ${{ needs.build.outputs.changelog }}
           draft: false
-          prerelease: false
+          prerelease: ${{ needs.build.outputs.prerelease }}
           files: build/libs/*
 
-  # Publish to Modrinth from the same tag push.
-  #
-  # This is a job here rather than a separate workflow on `release: published` on purpose:
-  # GitHub does not start workflows from events created with GITHUB_TOKEN, so the release
-  # created above would never trigger a separate publish workflow.
+  # Modrinth version, published from the same tag push. This is a job here rather than a separate
+  # workflow on `release: published` because GitHub does not start workflows from events created
+  # with GITHUB_TOKEN, so a release created above would never trigger one.
   modrinth:
     runs-on: ubuntu-24.04
     needs: build
@@ -82,9 +185,13 @@ jobs:
         with:
           token: ${{ secrets.MODRINTH_TOKEN }}
           project: ${{ secrets.MODRINTH_PROJECT_ID }}
-          version: ${{ github.ref_name }}
+          version: ${{ needs.build.outputs.version }}
+          name: NowPlayingSys ${{ needs.build.outputs.version }} for Minecraft ${{ needs.build.outputs.mc_label }}
+          channel: ${{ needs.build.outputs.channel }}
+          changelog: ${{ needs.build.outputs.changelog }}
           loaders: |-
             fabric
           game-versions: |-
-            26.3
+            ${{ needs.build.outputs.game_versions }}
+          dependencies: '[{"project_id":"P7dR8mSH","dependency_type":"required"}]'
           files: ${{ steps.jar.outputs.path }}
